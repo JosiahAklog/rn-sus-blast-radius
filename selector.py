@@ -69,51 +69,22 @@ def baseline(path):
     return content, ast.parse("\n".join(content) + "\n")
 
 
-def identity_equivalent(path, node, metadata):
-    prefix = f"{path}:{node.lineno}:{node.col_offset}:"
-    left, right = [metadata["observed"].get(prefix + side, []) for side in ("0", "1")]
-    if not left or not right:
-        return False
-    safe_with_none = {"object.__eq__", "NoneType.__eq__", "str.__eq__", "int.__eq__", "float.__eq__",
-                      "list.__eq__", "tuple.__eq__", "dict.__eq__", "bytes.__eq__"}
-    for a in left:
-        for b in right:
-            if a == "builtins.NoneType" or b == "builtins.NoneType":
-                other = b if a == "builtins.NoneType" else a
-                if metadata["definitions"][other][1] in safe_with_none:
-                    continue
-            if a == b:
-                is_enum, equality = metadata["definitions"][a]
-                if is_enum and equality in {"object.__eq__", "str.__eq__", "int.__eq__"}:
-                    continue
-                if equality == "object.__eq__":
-                    continue
-            return False
-    return True
-
-
-def equivalent(before, after, path, metadata):
+def equivalent(before, after):
     if type(before) is not type(after):
         return False
-    if isinstance(before, ast.Compare) and len(before.ops) == len(after.ops) == 1:
-        operators = type(before.ops[0]), type(after.ops[0])
-        if operators in {(ast.Is, ast.Eq), (ast.Eq, ast.Is)} and identity_equivalent(path, before, metadata):
-            return equivalent(before.left, after.left, path, metadata) and equivalent(
-                before.comparators, after.comparators, path, metadata
-            )
     if isinstance(before, ast.AST):
         return all(
-            equivalent(getattr(before, field, None), getattr(after, field, None), path, metadata)
+            equivalent(getattr(before, field, None), getattr(after, field, None))
             for field in before._fields
         )
     if isinstance(before, list):
         return len(before) == len(after) and all(
-            equivalent(old, new, path, metadata) for old, new in zip(before, after)
+            equivalent(old, new) for old, new in zip(before, after)
         )
     return before == after
 
 
-def compare(path, hunks, metadata):
+def compare(path, hunks):
     lines, tree = baseline(path)
     revised = list(lines)
     touched = set()
@@ -139,7 +110,10 @@ def compare(path, hunks, metadata):
             if tag != "+":
                 pos += 1
     updated = ast.parse("\n".join(revised) + "\n")
-    return equivalent(tree, updated, path, metadata), touched, tree
+    same = equivalent(tree, updated)
+    if not same:
+        compile(updated, path, "exec", dont_inherit=True)
+    return same, touched, tree
 
 
 def schedule(tests):
@@ -171,6 +145,10 @@ def combine(values):
     return mask
 
 
+def coverage_between(hits, start, end):
+    return combine(hits.get(line, 0) for line in range(start, end + 1))
+
+
 def main():
     data = Path(os.environ.get("BLAST_DATA", "/data"))
     tests = json.loads((data / "tests.json").read_text(encoding="utf-8"))["tests"]
@@ -183,9 +161,11 @@ def main():
         for t in tests
     }
     all_tests = combine(bits.values())
+    tests_by_file = {}
+    for test in tests:
+        file = test["file"]
+        tests_by_file[file] = tests_by_file.get(file, 0) | bits[test["number"]]
     rows = {p: {int(n): int(v, 16) for n, v in ns.items()} for p, ns in model["rows"].items()}
-    with gzip.open(APP / "types.json.gz", "rt") as f:
-        type_info = json.load(f)
     with gzip.open(APP / "classes.json.gz", "rt") as f:
         classes = {key: int(value, 16) for key, value in json.load(f).items()}
     for patch in sorted((data / "commits").glob("*.patch")):
@@ -204,40 +184,39 @@ def main():
                 mask |= all_tests
                 continue
             try:
-                same, touched, tree = compare(path, hunks, type_info)
+                same, touched, tree = compare(path, hunks)
             except (SyntaxError, OSError, ValueError, RecursionError):
                 mask |= all_tests
                 continue
             if same:
                 continue
-            funcs = [n for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda))]
+            module_hits = combine(hits.values())
+            if path.startswith("tests/"):
+                mask |= (tests_by_file.get(path, 0) | module_hits) or all_tests
+                continue
+            funcs = [
+                (node.body[0].lineno, node.end_lineno)
+                for node in ast.walk(tree)
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            ]
             for line in touched:
                 recorded = hits.get(line, 0)
-                functions = [n for n in funcs if n.lineno < line <= n.end_lineno]
+                functions = [(start, end) for start, end in funcs if start <= line <= end]
                 if functions:
-                    function = min(functions, key=lambda n: n.end_lineno - n.lineno)
-                    # Short-circuit edits can reach operands skipped on the baseline.
-                    for condition in ast.walk(function):
-                        if isinstance(condition, ast.BoolOp) and condition.lineno <= line <= condition.end_lineno:
-                            recorded |= hits.get(condition.lineno, 0)
-                    if not recorded:
-                        # Multiline expressions can be charged to the first line.
-                        for n in ast.walk(function):
-                            if isinstance(n, ast.stmt) and n.lineno <= line <= n.end_lineno:
-                                recorded |= hits.get(n.lineno, 0)
-                    if not recorded and isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                        recorded = hits.get(function.body[0].lineno, 0)
-                    mask |= recorded
+                    start, end = min(functions, key=lambda span: span[1] - span[0])
+                    # A changed branch can affect tests that previously took another path.
+                    function_hits = coverage_between(hits, start, end)
+                    mask |= (recorded | function_hits) or module_hits or all_tests
                     continue
                 owners = [n for n in ast.walk(tree) if isinstance(n, ast.ClassDef) and n.lineno < line <= n.end_lineno]
                 if path.startswith("sqlglot/expressions/") and owners:
                     owner = min(owners, key=lambda n: n.end_lineno - n.lineno)
                     key = path[:-3].replace("/", ".") + "." + owner.name
                     if key in classes:
-                        mask |= recorded | classes[key]
+                        mask |= recorded | classes[key] | coverage_between(hits, owner.lineno, owner.end_lineno)
                         continue
                 name = Path(path).stem
-                mask |= recorded | combine(hits.values())
+                mask |= recorded | module_hits
                 if path.startswith(("sqlglot/dialects/", "sqlglot/parsers/", "sqlglot/generators/", "sqlglot/typing/")) and name != "dialect":
                     for peer in ("dialects", "parsers", "generators", "typing"):
                         mask |= combine(rows.get(f"sqlglot/{peer}/{name}.py", {}).values())
